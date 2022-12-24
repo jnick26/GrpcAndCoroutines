@@ -103,6 +103,6 @@ target_link_libraries(GrpcPlusCoroutineTest PRIVATE GTest::gmock_main Schema cpp
 #
 # Main Executable
 #
-add_executable(GrpcPlusCoroutineBin main.cpp requests/RequestContext.cpp)
+add_executable(GrpcPlusCoroutineBin main.cpp)
 target_include_directories(GrpcPlusCoroutineBin PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(GrpcPlusCoroutineBin PRIVATE Schema absl::strings)
+target_link_libraries(GrpcPlusCoroutineBin PRIVATE Schema cppcoro)

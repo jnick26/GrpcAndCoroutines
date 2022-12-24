@@ -1,36 +1,70 @@
+#include <coroutine>
 #include <cstdio>
 
 #include "HelloWorld.grpc.pb.h"
 #include "HelloWorld.pb.h"
+#include "cppcoro/generator.hpp"
+#include "cppcoro/single_consumer_event.hpp"
+#include "cppcoro/sync_wait.hpp"
+#include "cppcoro/task.hpp"
+#include "cppcoro/when_all.hpp"
+#include "cppcoro/when_all_ready.hpp"
+#include "grpcpp/completion_queue.h"
 #include "grpcpp/security/server_credentials.h"
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/support/status.h>
 #include <memory>
+#include <thread>
 
 #include "grpcpp/server_context.h"
 #include "grpcpp/support/async_unary_call.h"
-#include "requests/RequestContext.h"
-#include "requests/Status.h"
-#include "requests/states/GetFeatureAcceptResponse.h"
-#include "requests/states/State.h"
 
 namespace {
 
 constexpr auto target = "localhost:50051";
 constexpr auto listeningPort = "0.0.0.0:50051";
 
-auto BuildGetFeatureRequest() {
-  auto getFeaturePointArg = ::route::Point();
-  getFeaturePointArg.set_latitude(10);
-  getFeaturePointArg.set_longitude(10);
-  return getFeaturePointArg;
-}
+using Flag = cppcoro::single_consumer_event;
 
 struct RouteServer {
+public:
   ::route::RouteService::AsyncService service;
   ::std::unique_ptr<::grpc::ServerCompletionQueue> completionQueue;
   ::std::unique_ptr<grpc::Server> server;
   ::grpc::ServerContext serverContext;
+};
+
+struct GetFeatureResponder {
+  using Request = cppcoro::task<::route::Point>;
+  using Response = cppcoro::task<::route::Feature>;
+
+  GetFeatureResponder(RouteServer &server)
+      : serverContext{}, server{server}, responder{&serverContext} {
+    server.service.RequestGetFeature(
+        &serverContext, &point, &responder, server.completionQueue.get(),
+        server.completionQueue.get(), &setPointFlag);
+  }
+
+  cppcoro::task<::route::Point> GetRequest() {
+    co_await setPointFlag;
+    co_return point;
+  }
+
+  cppcoro::task<void> SetResponse(::route::Feature feature) {
+    responder.Finish(feature, ::grpc::Status::OK, &doneFlag);
+    co_await doneFlag;
+  }
+
+public:
+  ::grpc::ServerContext serverContext;
+
+  ::route::Point point;
+  ::Flag setPointFlag;
+
+  ::Flag doneFlag;
+
+  ::RouteServer &server;
+  ::grpc::ServerAsyncResponseWriter<::route::Feature> responder;
 };
 
 auto BuildServer() {
@@ -49,10 +83,27 @@ auto BuildServer() {
 }
 
 struct RouteClient {
-  ::grpc::ClientContext clientContext;
-  std::shared_ptr<::grpc::Channel> channel;
-  std::unique_ptr<::route::RouteService::Stub> stub;
+public:
+  ::std::shared_ptr<::grpc::Channel> channel;
+  ::std::unique_ptr<::route::RouteService::Stub> stub;
   ::grpc::ServerCompletionQueue *completionQueue;
+
+public:
+  ::cppcoro::task<::route::Feature> GetFeature(::route::Point point) {
+    ::Flag flag;
+    ::route::Feature feature;
+    ::grpc::Status status;
+    ::grpc::ClientContext clientContext;
+    ::route::Point __point = point;
+
+    const auto getFeatureReader =
+        stub->AsyncGetFeature(&clientContext, __point, completionQueue);
+    getFeatureReader->Finish(&feature, &status, &flag);
+
+    co_await flag;
+
+    co_return feature;
+  }
 };
 
 auto BuildClient(::grpc::ServerCompletionQueue *completionQueue) {
@@ -64,149 +115,74 @@ auto BuildClient(::grpc::ServerCompletionQueue *completionQueue) {
   return std::move(client);
 }
 
-void CallAsyncGetFeature(const ::route::Point &point, RouteClient &client) {
-
-  const auto state = new ::requests::states::GetFeatureAcceptResponse();
-  const auto requestContext = new ::requests::RequestContext(state);
-
-  const auto getFeatureReader = client.stub->AsyncGetFeature(
-      &client.clientContext, point, client.completionQueue);
-  getFeatureReader->Finish(&state->feature, &state->status, requestContext);
+cppcoro::generator<std::pair<bool, ::Flag *>>
+poll(::grpc::CompletionQueue &cq) {
+  void *nextTag;
+  bool nextOk = false;
+  while (cq.Next(&nextTag, &nextOk)) {
+    co_yield std::make_pair(nextOk, static_cast<::Flag *>(nextTag));
+  }
 }
 
-struct Finisher : public ::requests::states::State {
-  ::requests::Status handle(bool ok) override {
-    return ::requests::Status::DONE;
-  }
-
-  const char *name() const override { return "Finisher"; }
-};
-
-struct GetFeatureResponseContext {
-
-  GetFeatureResponseContext(::grpc::ServerContext *serverContext)
-      : responder{std::make_unique<Responder>(serverContext)} {}
-
-  using Responder = ::grpc::ServerAsyncResponseWriter<::route::Feature>;
-  ::route::Point request;
-  ::route::Feature response;
-  std::unique_ptr<Responder> responder;
-};
-
-struct WaitDoneGetFeature : public ::requests::states::State {
-  WaitDoneGetFeature(std::unique_ptr<GetFeatureResponseContext> responseContext)
-      : responseContext(std::move(responseContext)) {}
-
-  ::requests::Status handle(bool ok) override {
-    std::cerr << "WaitDoneGetFeature::handle ok=" << ok << std::endl;
-    return ::requests::Status::DONE;
-  }
-
-  const char *name() const override { return "WaitDoneGetFeature"; }
-
-private:
-  std::unique_ptr<GetFeatureResponseContext> responseContext;
-};
-
-struct ServerGetFeatureDelegate {
-  using Response = std::pair<::grpc::Status, ::route::Feature>;
-  using Request = ::route::Point;
-
-  virtual Response OnGetFeature(const Request &) = 0;
-  virtual ~ServerGetFeatureDelegate() = default;
-};
-
-struct PrintingServerGetFeatureDelegate : public ServerGetFeatureDelegate {
-  Response OnGetFeature(const Request &request) override {
-    std::cerr << "Received request lat=" << request.latitude()
-              << " lon=" << request.longitude() << std::endl;
-    Response response;
-
-    std::get<::grpc::Status>(response) = ::grpc::Status::OK;
-    std::get<::route::Feature>(response).set_name("Very Cool Feature");
-    *std::get<::route::Feature>(response).mutable_location() = request;
-
-    return response;
-  }
-};
-
-struct WaitGetFeature : public ::requests::states::State {
-  void start(RouteServer &server,
-             std::unique_ptr<ServerGetFeatureDelegate> _delegate) {
-    responseContext =
-        std::make_unique<GetFeatureResponseContext>(&server.serverContext);
-    delegate = std::move(_delegate);
-    const auto completionQueue = server.completionQueue.get();
-    server.service.RequestGetFeature(
-        &server.serverContext, &responseContext->request,
-        responseContext->responder.get(), completionQueue, completionQueue,
-        GetContext());
-  }
-
-  ::requests::Status handle(bool ok) override {
-    if (ok) {
-      const auto response = delegate->OnGetFeature(responseContext->request);
-
-      responseContext->response = std::get<::route::Feature>(response);
-      responseContext->responder->Finish(responseContext->response,
-                                         std::get<::grpc::Status>(response),
-                                         GetContext());
-      const auto finisher = new WaitDoneGetFeature{std::move(responseContext)};
-      GetContext()->TransitionTo(finisher);
-      return ::requests::Status::CONTINUE;
-    } else {
-      return ::requests::Status::DONE;
-    }
-  }
-
-  const char *name() const override { return "WaitGetFeature"; }
-
-private:
-  std::unique_ptr<GetFeatureResponseContext> responseContext;
-  std::unique_ptr<ServerGetFeatureDelegate> delegate;
-};
-
-void RespondAsyncGetFeature(RouteServer &server) {
-  const auto state = new WaitGetFeature();
-  const auto context = new ::requests::RequestContext(state);
-  state->start(server, std::make_unique<PrintingServerGetFeatureDelegate>());
+void LogMessage(const google::protobuf::Message &message,
+                const std::string &tag) {
+  std::string buffer;
+  google::protobuf::util::MessageToJsonString(message, &buffer, {});
+  std::cout << tag << buffer << std::endl;
 }
 
 } // namespace
 
 int main() {
-
-  const std::vector<std::string> lines{"Hello", "World"};
-  for (std::string line : lines) {
-    std::cout << line << std::endl;
-  }
-
   const auto server = BuildServer();
   const auto completionQueue = server->completionQueue.get();
   const auto client = BuildClient(completionQueue);
 
-  RespondAsyncGetFeature(*server);
-  ::route::Point point;
-  point.set_latitude(10);
-  point.set_longitude(20);
-
-  CallAsyncGetFeature(point, *client);
-
-  void *nextTag;
-  bool nextOk = false;
-  while (completionQueue->Next(&nextTag, &nextOk)) {
-    std::cout << "loop nextTag=" << (void *)nextTag << " nextOk=" << nextOk
-              << "\n";
-    auto context = static_cast<::requests::RequestContext *>(nextTag);
-
-    switch (context->Handle(nextOk)) {
-    case ::requests::Status::CONTINUE:
-      break;
-
-    case ::requests::Status::DONE:
-      delete context;
-      break;
+  auto clientSequence = [&]() -> ::cppcoro::task<void> {
+    std::vector<::cppcoro::task<void>> tasks;
+    for (int lat = 0; lat < 10; ++lat) {
+      for (int lon = 0; lon < 10; ++lon) {
+        tasks.emplace_back([&](int a, int b) -> ::cppcoro::task<void> {
+          ::route::Point point;
+          point.set_latitude(a);
+          point.set_longitude(b);
+          LogMessage(point, "Sending request: ");
+          const auto feature = co_await client->GetFeature(point);
+          LogMessage(feature, "Received response: ");
+        }(lat, lon));
+      }
     }
-    std::cout << "loop done\n";
-  }
+    co_await ::cppcoro::when_all(std::move(tasks));
+  };
+
+  auto serverSequence = [&]() -> ::cppcoro::task<void> {
+    int i = 100;
+    while (i-- > 0) {
+      GetFeatureResponder responder{*server};
+      const auto request = co_await responder.GetRequest();
+      LogMessage(request, "Received request: ");
+      ::route::Feature f;
+      f.mutable_location()->set_latitude(request.latitude());
+      f.mutable_location()->set_longitude(request.longitude());
+      f.set_name("Cool name");
+      LogMessage(f, "Sending response: ");
+      co_await responder.SetResponse(f);
+    }
+  };
+
+  auto mainLoop = [&]() {
+    for (const auto [ok, flag] : poll(*completionQueue)) {
+      if (ok) {
+        flag->set();
+      } else {
+        std::cerr << "NOK\n";
+      }
+    }
+  };
+
+  std::thread mainLoopThread{mainLoop};
+
+  ::cppcoro::sync_wait(
+      ::cppcoro::when_all_ready(clientSequence(), serverSequence()));
+  mainLoopThread.join();
 }
